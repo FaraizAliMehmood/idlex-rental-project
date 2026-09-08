@@ -1,0 +1,209 @@
+const crypto = require('crypto');
+const User = require('../../models/User');
+const ApiError = require('../../utils/ApiError');
+const { signAccessToken, signRefreshToken, signPhoneVerificationToken, verifyPhoneVerificationToken } = require('../../utils/tokens');
+const { generateOtp, sendOtpSms, normalizePhone, issuePhoneOtp, verifyPhoneOtpRecord, issueEmailOtp, verifyEmailOtpRecord } = require('../../utils/otp');
+
+// Business logic lives here, controllers stay thin (parse req -> call
+// service -> shape response) — mirrors keeping Django views thin and
+// pushing logic into a services.py module.
+
+async function register({ name, email, phone, password, phoneVerificationToken }) {
+  const existing = await User.findOne({ email });
+  if (existing) throw ApiError.conflict('Email already registered');
+
+  let normalizedPhone;
+  if (phone) {
+    normalizedPhone = normalizePhone(phone);
+    if (!normalizedPhone) throw ApiError.badRequest('Enter a valid 10-digit phone number');
+    const phoneInUse = await User.findOne({ phone: normalizedPhone });
+    if (phoneInUse) throw ApiError.conflict('Phone number already registered');
+    if (!phoneVerificationToken) {
+      throw ApiError.badRequest('Verify your phone number with an OTP before creating the account');
+    }
+    try {
+      const payload = verifyPhoneVerificationToken(phoneVerificationToken);
+      if (payload.phone !== normalizedPhone || payload.purpose !== 'signup') {
+        throw new Error('mismatch');
+      }
+    } catch (err) {
+      throw ApiError.badRequest('Phone verification is invalid or expired. Request a new OTP');
+    }
+  }
+
+  const user = await User.create({ name, email, phone: normalizedPhone, password });
+  if (normalizedPhone) {
+    user.isPhoneVerified = true;
+    await user.save();
+  }
+  return issueTokens(user);
+}
+
+async function login({ email, password }) {
+  const user = await User.findOne({ email }).select('+password');
+  if (!user || !(await user.comparePassword(password))) {
+    throw ApiError.unauthorized('Invalid email or password');
+  }
+  if (!user.isActive) throw ApiError.forbidden('Account is suspended');
+  return issueTokens(user);
+}
+
+function issueTokens(user) {
+  return {
+    user: user.toSafeJSON(),
+    accessToken: signAccessToken(user),
+    refreshToken: signRefreshToken(user),
+  };
+}
+
+// Issues a phone OTP for signup or profile phone-change verification.
+// The number does not need an account yet — OTPs are stored separately.
+async function requestPhoneOtp(phone, purpose) {
+  const result = await issuePhoneOtp(phone, purpose);
+  if (!result) throw ApiError.badRequest('Enter a valid 10-digit phone number');
+  return result;
+}
+
+// Validates a phone OTP and returns a short-lived verification token the
+// caller must present when registering or saving a new profile number.
+async function verifyPhoneOtp(phone, code, purpose) {
+  const result = await verifyPhoneOtpRecord(phone, code, purpose);
+  if (!result.ok) {
+    if (result.reason === 'not_found') throw ApiError.badRequest('No OTP requested for this number');
+    if (result.reason === 'attempts') throw ApiError.badRequest('Too many incorrect attempts. Request a new OTP');
+    throw ApiError.badRequest('OTP is invalid or expired');
+  }
+  return { verified: true, token: signPhoneVerificationToken(result.phone, purpose) };
+}
+
+async function requestOtp(phone) {
+  const code = generateOtp();
+  const expiresAt = new Date(Date.now() + 50 * 60 * 1000); // 50 min
+
+  await User.findOneAndUpdate(
+    { phone },
+    { $set: { otp: { code, expiresAt } } },
+    { upsert: false }
+  );
+
+  await sendOtpSms(phone, code);
+}
+
+async function verifyOtp(phone, code) {
+  const user = await User.findOne({ phone }).select('+otp.code +otp.expiresAt');
+  if (!user || !user.otp || !user.otp.code) {
+    throw ApiError.badRequest('No OTP requested for this number');
+  }
+  if (user.otp.code !== code || user.otp.expiresAt < new Date()) {
+    throw ApiError.badRequest('OTP is invalid or expired');
+  }
+  user.isPhoneVerified = true;
+  user.otp = undefined;
+  await user.save();
+  return user.toSafeJSON();
+}
+
+async function requestEmailOtp(email) {
+  const user = await User.findOne({ email: email.trim().toLowerCase() });
+  if (!user) return; // don't leak whether the email exists
+
+  await issueEmailOtp(user._id, user.email, 'email_verify');
+}
+
+async function verifyEmailOtp(email, code) {
+  const user = await User.findOne({ email: email.trim().toLowerCase() }).select('+emailOtp.code +emailOtp.expiresAt +emailOtp.purpose');
+  if (!user) throw ApiError.notFound('No account found with this email');
+
+  const result = await verifyEmailOtpRecord(user._id, code, 'email_verify');
+  if (!result.ok) {
+    if (result.reason === 'no_request') throw ApiError.badRequest('No email verification code requested');
+    throw ApiError.badRequest('OTP is invalid or expired');
+  }
+
+  user.isEmailVerified = true;
+  await user.save();
+  return user.toSafeJSON();
+}
+
+async function requestPasswordReset(email) {
+  const user = await User.findOne({ email });
+  if (!user) return; // don't leak whether the email exists
+
+  const token = crypto.randomBytes(32).toString('hex');
+  user.passwordResetToken = crypto.createHash('sha256').update(token).digest('hex');
+  user.passwordResetExpires = new Date(Date.now() + 30 * 60 * 1000);
+  await user.save();
+
+  // In production: send `token` via an email provider (SendGrid/SES).
+  console.log(`[auth] Password reset token for ${email}: ${token}`);
+}
+
+async function confirmPasswordReset(token, newPassword) {
+  const hashed = crypto.createHash('sha256').update(token).digest('hex');
+  const user = await User.findOne({
+    passwordResetToken: hashed,
+    passwordResetExpires: { $gt: new Date() },
+  }).select('+passwordResetToken +passwordResetExpires');
+
+  if (!user) throw ApiError.badRequest('Reset token is invalid or expired');
+
+  user.password = newPassword;
+  user.passwordResetToken = undefined;
+  user.passwordResetExpires = undefined;
+  await user.save();
+}
+
+// Profile updates + renter->owner upgrade. `becomeOwner` is the only
+// path that sets the owner role — registration never accepts it, so
+// there is no privilege-escalation surface via register.
+async function updateMe(userId, { name, phone, phoneVerificationToken, avatarUrl, becomeOwner }) {
+  const user = await User.findById(userId);
+  if (!user) throw ApiError.notFound('User not found');
+
+  if (name !== undefined) user.name = name;
+  if (avatarUrl !== undefined) user.avatarUrl = avatarUrl;
+
+  // Changing the phone number requires OTP verification of the NEW
+  // number first — `phoneVerificationToken` proves it was verified.
+  if (phone !== undefined && phone !== user.phone) {
+    const normalized = normalizePhone(phone);
+    if (!normalized) throw ApiError.badRequest('Enter a valid 10-digit phone number');
+    const inUse = await User.findOne({ phone: normalized, _id: { $ne: userId } });
+    if (inUse) throw ApiError.conflict('Phone number already in use by another account');
+    if (!phoneVerificationToken) {
+      throw ApiError.badRequest('Verify the new phone number with an OTP before saving');
+    }
+    try {
+      const payload = verifyPhoneVerificationToken(phoneVerificationToken);
+      if (payload.phone !== normalized || payload.purpose !== 'profile') {
+        throw new Error('mismatch');
+      }
+    } catch (err) {
+      throw ApiError.badRequest('Phone verification is invalid or expired. Request a new OTP');
+    }
+    user.phone = normalized;
+    user.isPhoneVerified = true;
+  }
+
+  if (becomeOwner) {
+    user.role = 'owner';
+    user.isOwner = true;
+  }
+
+  await user.save();
+  return user.toSafeJSON();
+}
+
+module.exports = {
+  register,
+  login,
+  requestOtp,
+  verifyOtp,
+  requestPhoneOtp,
+  verifyPhoneOtp,
+  requestEmailOtp,
+  verifyEmailOtp,
+  requestPasswordReset,
+  confirmPasswordReset,
+  updateMe,
+};
